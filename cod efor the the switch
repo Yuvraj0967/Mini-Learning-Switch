@@ -1,0 +1,104 @@
+from ryu.base import app_manager
+from ryu.controller import ofp_event
+from ryu.controller.handler import MAIN_DISPATCHER, CONFIG_DISPATCHER, set_ev_cls
+from ryu.ofproto import ofproto_v1_3
+from ryu.lib.packet import packet, ethernet
+
+
+class SimpleSwitch(app_manager.RyuApp):
+    OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+
+    def __init__(self, *args, **kwargs):
+        super(SimpleSwitch, self).__init__(*args, **kwargs)
+        self.mac_to_port = {}  # Dictionary: {switch_id: {mac: port}}
+
+    # 🔹 Called when switch connects
+    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
+    def switch_features_handler(self, ev):
+        datapath = ev.msg.datapath
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        # Default rule: send all packets to controller
+        match = parser.OFPMatch()
+        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER)]
+        self.add_flow(datapath, 0, match, actions)
+
+        print("Switch connected. Default flow installed.")
+
+    # 🔹 Function to install flow rules
+    def add_flow(self, datapath, priority, match, actions):
+        parser = datapath.ofproto_parser
+        ofproto = datapath.ofproto
+
+        inst = [parser.OFPInstructionActions(
+            ofproto.OFPIT_APPLY_ACTIONS, actions)]
+
+        mod = parser.OFPFlowMod(
+            datapath=datapath,
+            priority=priority,
+            match=match,
+            instructions=inst)
+
+        datapath.send_msg(mod)
+
+    # 🔹 Main logic: packet handling
+    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
+    def packet_in_handler(self, ev):
+        msg = ev.msg
+        datapath = msg.datapath
+        parser = datapath.ofproto_parser
+        ofproto = datapath.ofproto
+
+        in_port = msg.match['in_port']
+        dpid = datapath.id
+
+        # Initialize MAC table for this switch
+        self.mac_to_port.setdefault(dpid, {})
+
+        # Extract packet
+        pkt = packet.Packet(msg.data)
+        eth = pkt.get_protocol(ethernet.ethernet)
+
+        # Ignore non-Ethernet packets
+        if eth is None:
+            return
+
+        dst = eth.dst
+        src = eth.src
+
+        print("\n--- Packet Received ---")
+        print(f"Switch ID: {dpid}")
+        print(f"Source MAC: {src}")
+        print(f"Destination MAC: {dst}")
+        print(f"Incoming Port: {in_port}")
+
+        # 🔹 Learn source MAC
+        self.mac_to_port[dpid][src] = in_port
+        print(f"Learned: {src} → Port {in_port}")
+
+        # 🔹 Decide output port
+        if dst in self.mac_to_port[dpid]:
+            out_port = self.mac_to_port[dpid][dst]
+            print(f"Known destination. Forwarding to Port {out_port}")
+        else:
+            out_port = ofproto.OFPP_FLOOD
+            print("Unknown destination. Flooding...")
+
+        actions = [parser.OFPActionOutput(out_port)]
+
+        # 🔹 Install flow rule (only if destination is known)
+        if out_port != ofproto.OFPP_FLOOD:
+            match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
+            self.add_flow(datapath, 1, match, actions)
+            print("Flow rule installed in switch.")
+
+        # 🔹 Send packet out
+        out = parser.OFPPacketOut(
+            datapath=datapath,
+            buffer_id=msg.buffer_id,
+            in_port=in_port,
+            actions=actions,
+            data=msg.data)
+
+        datapath.send_msg(out)
